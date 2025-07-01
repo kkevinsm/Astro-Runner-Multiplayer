@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <title>Astro-Runner Multiplayer</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Press+Start+2P&display=swap" rel="stylesheet">
@@ -118,7 +118,7 @@
                     this.velocityY = 0;
                     if (this.state === 'jumping') {
                         this.state = 'running';
-                        this.sendStateUpdate(); // Send update on landing
+                        this.sendStateUpdate();
                     }
                 }
             }
@@ -128,10 +128,7 @@
             }
             sendStateUpdate() {
                 if (gameRef && this.isLocal) {
-                    updateDoc(gameRef, {
-                        [`players.${this.id}.y`]: this.y,
-                        [`players.${this.id}.state`]: this.state
-                    });
+                    updateDoc(gameRef, { [`players.${this.id}`]: { y: this.y, state: this.state } });
                 }
             }
             draw() {
@@ -167,22 +164,37 @@
         }
         function update() {
             if (!localGameState.players || !players[localPlayerId]) return;
-            // Local player physics are driven by the animation frame for smoothness
             players[localPlayerId].updatePhysics();
-            // Host is the only one who can advance the game state
-            if (localGameState.hostId === localPlayerId) { hostUpdateLogic(); }
+            if (localGameState.status === 'playing') {
+                if (players[localPlayerId].state !== 'dead') {
+                    checkLocalCollision();
+                }
+                if (localGameState.hostId === localPlayerId) {
+                    hostUpdateSharedState();
+                }
+            }
         }
-        
-        function hostUpdateLogic() {
-            const serverState = localGameState;
-            if(serverState.status !== 'playing') return;
-
-            let updates = {};
+        function checkLocalCollision() {
+            const p = players[localPlayerId];
+            p.updateDimensions();
+            for (const o of obstacles) {
+                const hitboxPadding = 5;
+                if (p.x < o.x + o.width - hitboxPadding && p.x + p.width > o.x + hitboxPadding && p.y - p.height < o.y + o.height - hitboxPadding && p.y > o.y + hitboxPadding) {
+                    p.state = 'dead';
+                    updateDoc(gameRef, { [`players.${localPlayerId}.state`]: 'dead' });
+                    break;
+                }
+            }
+        }
+        function hostUpdateSharedState() {
+            if (localGameState.status !== 'playing') return;
             
-            // Update obstacles and score
-            let { speed, score, highScore, nextObstacleTime, obstacles: currentObstacles } = serverState;
+            let updates = {};
+            let { speed, score, highScore, nextObstacleTime, obstacles: currentObstacles, players: currentPlayers } = localGameState;
+
             updates.score = score + speed * 0.1;
             if(updates.score > highScore) { updates.highScore = updates.score; }
+            
             let updatedObstacles = currentObstacles.map(o => ({...o, x: o.x - speed}));
             if (Date.now() > nextObstacleTime) {
                 const type = Math.random() > 0.3 ? 'crystal' : 'asteroid';
@@ -192,31 +204,12 @@
             }
             updates.obstacles = updatedObstacles.filter(o => o.x + 50 > 0);
             
-            // Host-side collision detection for ALL players
-            const playerIds = Object.keys(serverState.players);
-            for (const id of playerIds) { 
-                const pState = serverState.players[id];
-                if (pState.state === 'dead') continue;
-
-                const pWidth = pState.state === 'ducking' ? 48 : 42;
-                const pHeight = pState.state === 'ducking' ? 35 : 50;
-                
-                for (const o of updatedObstacles) { 
-                    const hitboxPadding = 5;
-                    if (50 < o.x + o.width - hitboxPadding && 50 + pWidth > o.x + hitboxPadding && pState.y - pHeight < o.y + o.height - hitboxPadding && pState.y > o.y + hitboxPadding) { 
-                        updates[`players.${id}.state`] = 'dead';
-                        break; 
-                    } 
-                } 
-            }
+            const playerIds = Object.keys(currentPlayers);
+            const alivePlayers = playerIds.filter(id => currentPlayers[id] && currentPlayers[id].state !== 'dead');
             
-            // Check for winner
-            const playersAfterUpdate = { ...serverState.players, ...updates };
-            const stillAlive = Object.keys(playersAfterUpdate).filter(id => playersAfterUpdate[id].state !== 'dead');
-            
-            if (playerIds.length > 1 && stillAlive.length <= 1) { 
+            if (playerIds.length > 1 && alivePlayers.length <= 1) {
                 updates.status = 'finished';
-                updates.winner = stillAlive[0] || null;
+                updates.winner = alivePlayers[0] || null;
             }
 
             if (Object.keys(updates).length > 0) {
@@ -239,10 +232,15 @@
                 }
                 for (const id in serverState.players) {
                     if (!players[id]) players[id] = new Player(id, id === localPlayerId);
-                    // Only update remote players' state from the server
                     if (id !== localPlayerId) {
                         players[id].y = serverState.players[id].y;
+                    }
+                    // The local player's state is authoritative ONLY if they are not dead.
+                    // If the server says they are dead, they are dead.
+                    if (id === localPlayerId && players[id].state !== 'dead') {
                         players[id].state = serverState.players[id].state;
+                    } else {
+                         players[id].state = serverState.players[id].state;
                     }
                     players[id].updateDimensions();
                 }
@@ -256,7 +254,7 @@
             if (code) { await joinGame(code); } else { await createGame(); }
         }
         async function joinGame(id) {
-            gameRef = doc(db, "astro-runner-final-2", id);
+            gameRef = doc(db, "astro-runner-final", id);
             const gameSnap = await getDoc(gameRef);
             if (gameSnap.exists()) {
                 const gameData = gameSnap.data();
@@ -271,9 +269,9 @@
         async function createGame() {
             gameId = crypto.randomUUID().split('-')[0].substring(0,5);
             gameCodeInput.value = gameId;
-            gameRef = doc(db, "astro-runner-final-2", gameId);
+            gameRef = doc(db, "astro-runner-final", gameId);
             const previousHighScore = localGameState.highScore || 0;
-            await setDoc(gameRef, { status: 'waiting', players: { [localPlayerId]: { y: GROUND_Y, state: 'running' } }, obstacles: [], winner: null, hostId: localPlayerId, nextObstacleTime: Date.now() + 5000, speed: 5, score: 0, highScore: previousHighScore });
+            await setDoc(gameRef, { status: 'waiting', players: { [localPlayerId]: { y: GROUND_Y, state: 'running' } }, obstacles: [], winner: null, hostId: localPlayerId, nextObstacleTime: Date.now() + 6000, speed: 5, score: 0, highScore: previousHighScore });
             setupGameListener();
         }
         async function resetGame() {
