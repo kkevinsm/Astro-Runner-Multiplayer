@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Astro-Runner Multiplayer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Press+Start+2P&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; overflow-x: hidden; background-color: #0f172a; color: #e2e8f0; }
+        .font-game { font-family: 'Press Start 2P', cursive; }
+        canvas { background-color: #1e293b; border-bottom: 2px solid #475569; width: 100%; display: block; }
+        .info-panel { background-color: #1e293b; border: 2px solid #334155; }
+        #restart-button {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 1rem 2rem;
+            font-size: 1.5rem;
+            cursor: pointer;
+        }
+        #mobile-controls {
+            display: none;
+        }
+        @media (pointer: coarse) {
+            #mobile-controls {
+                display: grid;
+            }
+        }
+    </style>
+</head>
+<body class="flex flex-col items-center justify-center min-h-screen p-4">
+
+    <div class="w-full max-w-2xl text-center mb-4 p-4 bg-slate-800 rounded-lg shadow-lg">
+        <h1 class="text-4xl font-bold font-game text-white">Astro-Runner</h1>
+        <label for="gameCodeInput" class="font-game text-lg mt-4 block">KODE GAME</label>
+        <div class="flex flex-col sm:flex-row justify-center items-center mt-2">
+            <input type="text" id="gameCodeInput" placeholder="Kosongkan untuk membuat game baru" class="text-center p-2 rounded-md w-full sm:w-80 bg-gray-100 text-gray-900">
+            <button id="connectBtn" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-md mt-2 sm:mt-0 sm:rounded-l-none w-full sm:w-auto">BUAT / GABUNG</button>
+        </div>
+    </div>
+
+    <div id="game-container" class="relative w-full max-w-4xl">
+        <canvas id="gameCanvas"></canvas>
+        <p id="status-text" class="absolute top-2 left-2 font-game text-slate-400 text-xs sm:text-base"></p>
+        <button id="restart-button" class="hidden font-game bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold py-2 px-4 rounded-lg">RESTART</button>
+    </div>
+
+    <div id="mobile-controls" class="grid grid-cols-2 gap-4 w-full max-w-4xl mt-4">
+        <button id="jumpBtn" class="bg-slate-700 text-white font-game p-4 rounded-lg text-2xl">JUMP</button>
+        <button id="duckBtn" class="bg-slate-700 text-white font-game p-4 rounded-lg text-2xl">DUCK</button>
+    </div>
+
+
+    <script type="module">
+        // --- Firebase Imports ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Your Firebase Config ---
+        const firebaseConfig = {
+            apiKey: "AIzaSyBCCiu_UC4WgGitM-l95RAfZtNNSS4a5Lo",
+            authDomain: "dino-race-multiplayer.firebaseapp.com",
+            projectId: "dino-race-multiplayer",
+            storageBucket: "dino-race-multiplayer.appspot.com",
+            messagingSenderId: "947214374427",
+            appId: "1:947214374427:web:34583af5559736d8ac0abe",
+            measurementId: "G-5XJC02LZJC"
+        };
+        
+        // --- Global Variables ---
+        const canvas = document.getElementById('gameCanvas'), ctx = canvas.getContext('2d');
+        const statusText = document.getElementById('status-text'), gameCodeInput = document.getElementById('gameCodeInput'), connectBtn = document.getElementById('connectBtn');
+        const restartButton = document.getElementById('restart-button');
+        const jumpBtn = document.getElementById('jumpBtn'), duckBtn = document.getElementById('duckBtn');
+        let app, db, auth, localPlayerId, gameId, gameRef, unsubscribe;
+        let charRun1Img, charRun2Img, charDuckImg, crystalImg, asteroidImg;
+        let localGameState = {}, players = {}, obstacles = [], animationFrame = 0;
+        let GRAVITY = 0.6, JUMP_FORCE = -14, GROUND_Y;
+
+        // --- Classes ---
+        class Player {
+            constructor(id, isLocal) {
+                this.id = id;
+                this.isLocal = isLocal;
+                this.x = 50;
+                this.reset();
+            }
+            reset() {
+                this.y = GROUND_Y;
+                this.width = 42;
+                this.height = 50;
+                this.velocityY = 0;
+                this.state = 'running';
+            }
+            jump() {
+                if (this.state !== 'dead' && this.state !== 'jumping') {
+                    this.velocityY = JUMP_FORCE;
+                    this.state = 'jumping';
+                    if (this.isLocal) this.sendStateUpdate();
+                }
+            }
+            duck(isDucking) {
+                if (this.state !== 'dead' && this.state !== 'jumping') {
+                    this.state = isDucking ? 'ducking' : 'running';
+                    if (this.isLocal) this.sendStateUpdate();
+                }
+            }
+            updatePhysics() {
+                if (this.state === 'jumping') {
+                    this.velocityY += GRAVITY;
+                    this.y += this.velocityY;
+                }
+                if (this.y >= GROUND_Y) {
+                    this.y = GROUND_Y;
+                    this.velocityY = 0;
+                    if (this.state === 'jumping') {
+                        this.state = 'running';
+                        this.sendStateUpdate();
+                    }
+                }
+            }
+            updateDimensions() {
+                if (this.state === 'ducking') { this.width = 48; this.height = 35; } 
+                else { this.width = 42; this.height = 50; }
+            }
+            sendStateUpdate() {
+                if (gameRef && this.isLocal) {
+                    updateDoc(gameRef, { [`players.${this.id}`]: { y: this.y, state: this.state } });
+                }
+            }
+            draw() {
+                let img;
+                if (this.state === 'dead') { ctx.globalAlpha = 0.5; img = charRun1Img; } 
+                else if (this.state === 'ducking') { img = charDuckImg; } 
+                else if (this.state === 'jumping') { img = charRun1Img; } 
+                else { img = (Math.floor(animationFrame / 6) % 2 === 0) ? charRun1Img : charRun2Img; }
+                if (img) { ctx.drawImage(img, this.x, this.y - this.height, this.width, this.height); }
+                ctx.globalAlpha = 1.0;
+            }
+        }
+        class Obstacle {
+            constructor(config) { this.x = config.x; this.type = config.type; if (this.type === 'crystal') { this.width = 25; this.height = 50; this.y = GROUND_Y - this.height; } else { this.width = 46; this.height = 55; this.y = GROUND_Y - 85; } }
+            draw() { const img = this.type === 'crystal' ? crystalImg : asteroidImg; if (img) { ctx.drawImage(img, this.x, this.y, this.width, this.height); } }
+        }
+
+        // --- Game Logic ---
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#1e293b'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#334155'; ctx.fillRect(0, GROUND_Y, canvas.width, canvas.height - GROUND_Y);
+            obstacles.forEach(o => o.draw());
+            for (const id in players) { if(players[id]) players[id].draw(); }
+            if((localGameState.status === 'playing' || localGameState.status === 'finished') && localGameState.score !== undefined) {
+                ctx.textAlign = 'right';
+                ctx.font = `${canvas.width / 40}px 'Press Start 2P'`;
+                ctx.fillStyle = '#cbd5e1';
+                const score = Math.floor(localGameState.score).toString().padStart(5, '0');
+                const hiScore = Math.floor(localGameState.highScore || 0).toString().padStart(5, '0');
+                ctx.fillText(`HI ${hiScore} ${score}`, canvas.width - 20, 30);
+            }
+        }
+        function update() {
+            if (!localGameState.players || !players[localPlayerId]) return;
+            players[localPlayerId].updatePhysics();
+            if (localGameState.status === 'playing') {
+                if (players[localPlayerId].state !== 'dead') {
+                    checkLocalCollision();
+                }
+                if (localGameState.hostId === localPlayerId) {
+                    hostUpdateSharedState();
+                }
+            }
+        }
+        function checkLocalCollision() {
+            const p = players[localPlayerId];
+            p.updateDimensions();
+            for (const o of obstacles) {
+                const hitboxPadding = 5;
+                if (p.x < o.x + o.width - hitboxPadding && p.x + p.width > o.x + hitboxPadding && p.y - p.height < o.y + o.height - hitboxPadding && p.y > o.y + hitboxPadding) {
+                    p.state = 'dead';
+                    updateDoc(gameRef, { [`players.${localPlayerId}.state`]: 'dead' });
+                    break;
+                }
+            }
+        }
+        function hostUpdateSharedState() {
+            if (localGameState.status !== 'playing') return;
+            
+            let updates = {};
+            let { speed, score, highScore, nextObstacleTime, obstacles: currentObstacles, players: currentPlayers } = localGameState;
+
+            updates.score = score + speed * 0.1;
+            if(updates.score > highScore) { updates.highScore = updates.score; }
+            
+            let updatedObstacles = currentObstacles.map(o => ({...o, x: o.x - speed}));
+            if (Date.now() > nextObstacleTime) {
+                const type = Math.random() > 0.3 ? 'crystal' : 'asteroid';
+                updatedObstacles.push({ type: type, x: canvas.width });
+                updates.nextObstacleTime = Date.now() + (Math.random() * 1000) + (1500 / speed * 5);
+                updates.speed = Math.min(15, speed + 0.1);
+            }
+            updates.obstacles = updatedObstacles.filter(o => o.x + 50 > 0);
+            
+            const playerIds = Object.keys(currentPlayers);
+            const alivePlayers = playerIds.filter(id => currentPlayers[id] && currentPlayers[id].state !== 'dead');
+            
+            if (playerIds.length > 1 && alivePlayers.length <= 1) {
+                updates.status = 'finished';
+                updates.winner = alivePlayers[0] || null;
+            }
+
+            if (Object.keys(updates).length > 0) {
+                updateDoc(gameRef, updates);
+            }
+        }
+        function gameLoop() { animationFrame++; update(); draw(); requestAnimationFrame(gameLoop); }
+
+        // --- Firebase & State Logic ---
+        function setupGameListener() {
+            if (unsubscribe) unsubscribe();
+            unsubscribe = onSnapshot(gameRef, (doc) => {
+                const serverState = doc.data(); if (!serverState) return;
+                localGameState = serverState;
+                const playerCount = Object.keys(serverState.players || {}).length;
+                switch (serverState.status) {
+                    case 'waiting': statusText.textContent = `Menunggu Pemain 2... (${playerCount}/2)`; restartButton.classList.add('hidden'); break;
+                    case 'playing': statusText.textContent = `Lari! (${playerCount}/2)`; restartButton.classList.add('hidden'); break;
+                    case 'finished': const winnerName = serverState.winner === localPlayerId ? "Kamu" : "Lawan"; statusText.innerHTML = `Game Selesai! <span class="font-bold text-yellow-400">${winnerName} menang!</span>`; if(localPlayerId === serverState.hostId) { restartButton.classList.remove('hidden'); } break;
+                }
+                for (const id in serverState.players) {
+                    if (!players[id]) players[id] = new Player(id, id === localPlayerId);
+                    if (id !== localPlayerId) {
+                        players[id].y = serverState.players[id].y;
+                    }
+                    // The local player's state is authoritative ONLY if they are not dead.
+                    // If the server says they are dead, they are dead.
+                    if (id === localPlayerId && players[id].state !== 'dead') {
+                        players[id].state = serverState.players[id].state;
+                    } else {
+                         players[id].state = serverState.players[id].state;
+                    }
+                    players[id].updateDimensions();
+                }
+                obstacles = serverState.obstacles.map(o => new Obstacle(o));
+            });
+        }
+        async function connectToServer() {
+            const code = gameCodeInput.value.trim().toLowerCase();
+            connectBtn.disabled = true;
+            statusText.textContent = "Menghubungkan...";
+            if (code) { await joinGame(code); } else { await createGame(); }
+        }
+        async function joinGame(id) {
+            gameRef = doc(db, "astro-runner-final", id);
+            const gameSnap = await getDoc(gameRef);
+            if (gameSnap.exists()) {
+                const gameData = gameSnap.data();
+                if (Object.keys(gameData.players).length < 2 && !gameData.players[localPlayerId]) {
+                    await updateDoc(gameRef, { [`players.${localPlayerId}`]: { y: GROUND_Y, state: 'running' }, status: 'playing' });
+                }
+                gameId = id;
+                gameCodeInput.value = id;
+                setupGameListener();
+            } else { statusText.textContent = "Game tidak ditemukan."; connectBtn.disabled = false; }
+        }
+        async function createGame() {
+            gameId = crypto.randomUUID().split('-')[0].substring(0,5);
+            gameCodeInput.value = gameId;
+            gameRef = doc(db, "astro-runner-final", gameId);
+            const previousHighScore = localGameState.highScore || 0;
+            await setDoc(gameRef, { status: 'waiting', players: { [localPlayerId]: { y: GROUND_Y, state: 'running' } }, obstacles: [], winner: null, hostId: localPlayerId, nextObstacleTime: Date.now() + 6000, speed: 5, score: 0, highScore: previousHighScore });
+            setupGameListener();
+        }
+        async function resetGame() {
+            if (!gameRef || localGameState.hostId !== localPlayerId) return;
+            const newPlayersState = {};
+            Object.keys(localGameState.players).forEach(id => {
+                newPlayersState[id] = { y: GROUND_Y, state: 'running' };
+            });
+            await updateDoc(gameRef, {
+                status: 'playing',
+                players: newPlayersState,
+                obstacles: [],
+                winner: null,
+                score: 0,
+                speed: 5,
+                nextObstacleTime: Date.now() + 6000,
+            });
+        }
+
+        // --- Main Startup Function ---
+        async function runGame() {
+            try {
+                [charRun1Img, charRun2Img, charDuckImg, crystalImg, asteroidImg] = await Promise.all([
+                    loadImage('assets/astro_run_1.svg'),
+                    loadImage('assets/astro_run_2.svg'),
+                    loadImage('assets/astro_duck.svg'),
+                    loadImage('assets/crystal.svg'),
+                    loadImage('assets/asteroid.svg')
+                ]);
+                statusText.textContent = "Siap untuk terhubung.";
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        if (localPlayerId) return; 
+                        localPlayerId = user.uid;
+                        connectBtn.disabled = false;
+                        requestAnimationFrame(gameLoop);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                });
+            } catch (error) {
+                console.error("Gagal memulai game:", error);
+                statusText.textContent = `Error: ${(error && error.message) ? error.message : 'Gagal memulai, coba muat ulang halaman.'}`;
+            }
+        }
+        
+        // --- Helpers ---
+        function resizeCanvas() {
+            const container = document.getElementById('game-container');
+            const aspectRatio = 16 / 9;
+            const newWidth = container.clientWidth;
+            const newHeight = newWidth / aspectRatio;
+            canvas.width = newWidth;
+            canvas.height = newHeight;
+            GROUND_Y = canvas.height - 40;
+            const scaleFactor = canvas.width / 800;
+            JUMP_FORCE = -14 * scaleFactor;
+            GRAVITY = 0.6 * scaleFactor;
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        
+        document.addEventListener('keydown', (e) => { const p = players[localPlayerId]; if (!p || p.state === 'dead') return; switch (e.code) { case 'Space': case 'ArrowUp': e.preventDefault(); p.jump(); break; case 'ArrowDown': e.preventDefault(); p.duck(true); break; } });
+        document.addEventListener('keyup', (e) => { const p = players[localPlayerId]; if (!p || p.state === 'dead') return; if (e.code === 'ArrowDown') { e.preventDefault(); p.duck(false); } });
+        
+        jumpBtn.addEventListener('touchstart', (e) => { e.preventDefault(); const p = players[localPlayerId]; if (p && p.state !== 'dead') p.jump(); });
+        duckBtn.addEventListener('touchstart', (e) => { e.preventDefault(); const p = players[localPlayerId]; if (p && p.state !== 'dead') p.duck(true); });
+        duckBtn.addEventListener('touchend', (e) => { e.preventDefault(); const p = players[localPlayerId]; if (p && p.state !== 'dead') p.duck(false); });
+        
+        restartButton.addEventListener('click', resetGame);
+        connectBtn.addEventListener('click', connectToServer);
+        
+        function loadImage(src) {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                img.onload = () => resolve(img);
+                img.onerror = () => reject(new Error(`Gagal memuat gambar dari: ${src}`));
+                img.src = src;
+            });
+        }
+        
+        // --- GO! ---
+        resizeCanvas();
+        runGame();
+
+    </script>
+</body>
+</html>
